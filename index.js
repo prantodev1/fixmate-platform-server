@@ -1995,6 +1995,282 @@ app.patch(
   }
 );
 
+async function createTechnicianServiceHandler(req, res) {
+  try {
+    const {
+      title,
+      category,
+      mode,
+      price,
+      duration,
+      area,
+      description,
+      image,
+      technicianName,
+    } = req.body;
+
+    if (!title || !category || !price || !area || !description) {
+      return res.status(400).json({
+        success: false,
+        message: "Title, category, price, area, and description are required.",
+      });
+    }
+
+    if (Number(price) <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Price must be greater than 0.",
+      });
+    }
+
+    const dbUser = await User.findById(req.user.userId);
+    const safeName =
+      dbUser?.name || technicianName?.trim() || req.user.email.split("@")[0];
+    const safeEmail = (dbUser?.email || req.user.email).toLowerCase().trim();
+    const currentPlan = normalizeUserPlan(dbUser?.plan);
+
+    if (currentPlan !== "pro") {
+      const existingServiceCount = await Service.countDocuments({
+        $or: [
+          { technicianId: req.user.userId },
+          ...(safeEmail ? [{ technicianEmail: safeEmail }] : []),
+        ],
+      });
+
+      if (existingServiceCount >= FREE_PLAN_SERVICE_LIMIT) {
+        return res.status(403).json({
+          success: false,
+          code: "FREE_PLAN_LIMIT_REACHED",
+          plan: "free",
+          limit: FREE_PLAN_SERVICE_LIMIT,
+          currentCount: existingServiceCount,
+          message: `Free technicians can list up to ${FREE_PLAN_SERVICE_LIMIT} services. Upgrade to the Pro Technician Plan for unlimited services and a Verified Pro badge.`,
+        });
+      }
+    }
+
+    const newService = await Service.create({
+      title: String(title).trim(),
+      category: String(category).trim(),
+      mode: mode ? String(mode).trim() : "Home Visit",
+      price: Number(price),
+      duration: duration ? String(duration).trim() : "1-2 hours",
+      area: String(area).trim(),
+      description: String(description).trim(),
+      image: image || "",
+      technicianId: req.user.userId,
+      technicianName: safeName,
+      technicianEmail: safeEmail,
+      status: "pending",
+      available: true,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Service submitted for review.",
+      data: {
+        ...newService.toObject(),
+        technicianPlan: currentPlan,
+        isVerifiedPro: currentPlan === "pro",
+      },
+    });
+  } catch (error) {
+    console.error("Error creating technician service:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+}
+
+app.post(
+  "/api/services",
+  verifyToken,
+  verifyTechnician,
+  createTechnicianServiceHandler
+);
+app.post(
+  "/api/technician/services",
+  verifyToken,
+  verifyTechnician,
+  createTechnicianServiceHandler
+);
+
+app.get(
+  "/api/technician/services",
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const normalizedEmail = (req.user.email || "").toLowerCase().trim();
+      const [dbUser, rawServices] = await Promise.all([
+        User.findById(req.user.userId).select("plan"),
+        Service.find({
+          $or: [
+            { technicianId: req.user.userId },
+            { technicianEmail: normalizedEmail },
+          ],
+        }).sort({ createdAt: -1 }),
+      ]);
+      const withTech = await attachLatestTechnicianNames(rawServices);
+      const services = await attachRatingsToServices(withTech);
+      const plan = normalizeUserPlan(dbUser?.plan);
+
+      res.status(200).json({
+        success: true,
+        count: services.length,
+        plan,
+        isVerifiedPro: plan === "pro",
+        serviceLimit: plan === "pro" ? null : FREE_PLAN_SERVICE_LIMIT,
+        data: services,
+      });
+    } catch (error) {
+      console.error("Error fetching technician services:", error);
+      res.status(500).json({
+        success: false,
+        message: "Internal Server Error",
+      });
+    }
+  }
+);
+
+async function updateTechnicianServiceHandler(req, res) {
+  try {
+    const service = await Service.findById(req.params.id);
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    const normalizedEmail = (req.user.email || "").toLowerCase().trim();
+    const isOwner =
+      (service.technicianId &&
+        String(service.technicianId) === String(req.user.userId)) ||
+      (service.technicianEmail || "").toLowerCase().trim() === normalizedEmail;
+
+    if (!isOwner) {
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden: You can only update your own services",
+      });
+    }
+
+    const allowedFields = [
+      "title",
+      "category",
+      "mode",
+      "price",
+      "duration",
+      "area",
+      "description",
+      "image",
+      "available",
+    ];
+
+    for (const field of allowedFields) {
+      if (req.body[field] !== undefined) {
+        service[field] =
+          field === "price" ? Number(req.body[field]) : req.body[field];
+      }
+    }
+
+    const editedCoreFields = [
+      "title",
+      "category",
+      "mode",
+      "price",
+      "duration",
+      "area",
+      "description",
+      "image",
+    ].some((key) => req.body[key] !== undefined);
+
+    if (editedCoreFields && service.status === "approved") {
+      service.status = "pending";
+    }
+
+    await service.save();
+
+    res.status(200).json({
+      success: true,
+      message: "Service updated successfully",
+      data: service,
+    });
+  } catch (error) {
+    console.error("Error updating technician service:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+}
+
+app.patch(
+  "/api/services/:id",
+  verifyToken,
+  verifyTechnician,
+  updateTechnicianServiceHandler
+);
+app.patch(
+  "/api/technician/services/:id",
+  verifyToken,
+  verifyTechnician,
+  updateTechnicianServiceHandler
+);
+
+async function deleteTechnicianServiceHandler(req, res) {
+  try {
+    const service = await Service.findById(req.params.id);
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    const normalizedEmail = (req.user.email || "").toLowerCase().trim();
+    const isOwner =
+      (service.technicianId &&
+        String(service.technicianId) === String(req.user.userId)) ||
+      (service.technicianEmail || "").toLowerCase().trim() === normalizedEmail;
+
+    if (!isOwner) {
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden: You can only delete your own services",
+      });
+    }
+
+    await Service.findByIdAndDelete(req.params.id);
+
+    res.status(200).json({
+      success: true,
+      message: "Service deleted successfully",
+    });
+  } catch (error) {
+    console.error("Error deleting technician service:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+}
+
+app.delete(
+  "/api/services/:id",
+  verifyToken,
+  verifyTechnician,
+  deleteTechnicianServiceHandler
+);
+app.delete(
+  "/api/technician/services/:id",
+  verifyToken,
+  verifyTechnician,
+  deleteTechnicianServiceHandler
+);
+
 async function startServer() {
   try {
     await connectDB();
