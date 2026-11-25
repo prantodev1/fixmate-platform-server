@@ -27,19 +27,34 @@ if (process.env.STRIPE_SECRET_KEY) {
   }
 }
 
-const allowedOrigins = [
-  "http://localhost:3000",
-  process.env.CLIENT_URL,
-].filter(Boolean);
+const normalizeOrigin = (value) =>
+  String(value || "").trim().replace(/\/+$/, "");
+
+const allowedOrigins = ["http://localhost:3000", process.env.CLIENT_URL]
+  .filter(Boolean)
+  .map(normalizeOrigin);
+
+// Vercel assigns a unique hostname to the production project and every preview
+// deployment, so allow this client's vercel.app domains in addition to CLIENT_URL.
+const allowedVercelOrigin =
+  /^https:\/\/fixmate-platform-client(?:-[a-z0-9-]+)?\.vercel\.app$/i;
 
 app.use(
   cors({
     origin: function (origin, callback) {
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error("Not allowed by CORS"));
+      if (!origin) {
+        return callback(null, true);
       }
+
+      const normalizedOrigin = normalizeOrigin(origin);
+      if (
+        allowedOrigins.includes(normalizedOrigin) ||
+        allowedVercelOrigin.test(normalizedOrigin)
+      ) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("Not allowed by CORS"));
     },
     credentials: true,
   })
