@@ -1406,6 +1406,595 @@ app.get("/api/services/:id", async (req, res) => {
   }
 });
 
+app.post("/api/bookings", verifyToken, verifyCustomer, async (req, res) => {
+  try {
+    const { serviceId, phone, address, preferredDate, problemDescription } =
+      req.body;
+
+    if (
+      !serviceId ||
+      !phone ||
+      !address ||
+      !preferredDate ||
+      !problemDescription
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Phone, address, preferred date, and problem description are required.",
+      });
+    }
+
+    const trimmedDesc = String(problemDescription).trim();
+    if (trimmedDesc.length < 20) {
+      return res.status(400).json({
+        success: false,
+        message: "Problem description must be at least 20 characters.",
+      });
+    }
+
+    const todayStr = new Date().toISOString().split("T")[0];
+    if (String(preferredDate) < todayStr) {
+      return res.status(400).json({
+        success: false,
+        message: "Preferred date must be today or a future date.",
+      });
+    }
+
+    const service = await Service.findById(serviceId);
+    const isApproved =
+      (service?.status || "approved").toString().toLowerCase() === "approved";
+    const isAvailable = service?.available !== false;
+
+    if (!service || !isApproved || !isAvailable) {
+      return res.status(404).json({
+        success: false,
+        message: "This service is unavailable or not found.",
+      });
+    }
+
+    const customer = await User.findById(req.user.userId).select(
+      "name email role"
+    );
+    if (!customer) {
+      return res.status(404).json({
+        success: false,
+        message: "Customer account not found.",
+      });
+    }
+
+    const normalizedCustomerEmail = customer.email.toLowerCase().trim();
+
+    const existingActiveBooking = await Booking.findOne({
+      serviceId: service._id,
+      customerEmail: normalizedCustomerEmail,
+      status: { $in: ["requested", "accepted", "in-progress"] },
+    });
+
+    if (existingActiveBooking) {
+      return res.status(409).json({
+        success: false,
+        message: "You already have an active request for this service",
+      });
+    }
+
+    const techUser = await findTechnicianUserRecord(service);
+    const createdAt = new Date();
+
+    const newBooking = await Booking.create({
+      serviceId: service._id,
+      serviceTitle: service.title,
+      serviceCategory: service.category,
+      serviceMode: service.mode || "Home Visit",
+      serviceArea: service.area || "",
+      startingPrice: Number(service.price || 0),
+      totalPrice: Number(service.price || 0),
+      estimatedDuration: service.duration || "1-2 hours",
+      serviceImage: service.image || "",
+      technicianId: techUser?._id || service.technicianId || null,
+      technicianName: techUser?.name || service.technicianName || "Technician",
+      technicianEmail: (
+        techUser?.email ||
+        service.technicianEmail ||
+        ""
+      ).toLowerCase(),
+      technicianPhone: techUser?.phone || "",
+      technicianArea: techUser?.area || service.area || "",
+      customerId: customer._id,
+      customerName: customer.name,
+      customerEmail: normalizedCustomerEmail,
+      phone: String(phone).trim(),
+      address: String(address).trim(),
+      preferredDate: String(preferredDate).trim(),
+      problemDescription: trimmedDesc,
+      status: "requested",
+      paymentStatus: "unpaid",
+      statusHistory: [{ status: "requested", changedAt: createdAt }],
+    });
+
+    await appendBookingStatusHistory(newBooking._id, "requested", createdAt);
+
+    res.status(201).json({
+      success: true,
+      message: "Repair request submitted successfully.",
+      data: normalizeBookingRecord(newBooking),
+    });
+  } catch (error) {
+    console.error("Error creating booking request:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+});
+
+app.get("/api/bookings/my", verifyToken, verifyCustomer, async (req, res) => {
+  try {
+    const normalizedEmail = (req.user.email || "").toLowerCase().trim();
+    const rawBookings = await Booking.collection
+      .find({
+        $or: [
+          { customerId: req.user.userId },
+          { customerEmail: normalizedEmail },
+        ],
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+    const bookings = await attachLatestTechnicianNamesToBookings(rawBookings);
+
+    res.status(200).json({
+      success: true,
+      count: bookings.length,
+      data: bookings,
+    });
+  } catch (error) {
+    console.error("Error fetching customer bookings:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+});
+
+app.patch(
+  "/api/bookings/:id/cancel",
+  verifyToken,
+  verifyCustomer,
+  async (req, res) => {
+    try {
+      const booking = await Booking.findById(req.params.id);
+      if (!booking) {
+        return res.status(404).json({
+          success: false,
+          message: "Booking not found",
+        });
+      }
+
+      const normalizedEmail = (req.user.email || "").toLowerCase().trim();
+      const isOwner =
+        (booking.customerId &&
+          String(booking.customerId) === String(req.user.userId)) ||
+        (booking.customerEmail || "").toLowerCase().trim() === normalizedEmail;
+
+      if (!isOwner) {
+        return res.status(403).json({
+          success: false,
+          message: "Forbidden: You cannot cancel another customer's booking",
+        });
+      }
+
+      if (booking.status !== "requested") {
+        return res.status(400).json({
+          success: false,
+          message: "Only requested bookings can be cancelled.",
+        });
+      }
+
+      const cancelledAt = new Date();
+      booking.status = "cancelled";
+      await booking.save();
+      await appendBookingStatusHistory(booking._id, "cancelled", cancelledAt);
+
+      const freshRaw = await Booking.collection.findOne({ _id: booking._id });
+
+      res.status(200).json({
+        success: true,
+        message: "Booking request cancelled successfully",
+        data: normalizeBookingRecord(freshRaw || booking),
+      });
+    } catch (error) {
+      console.error("Error cancelling booking:", error);
+      res.status(500).json({
+        success: false,
+        message: "Internal Server Error",
+      });
+    }
+  }
+);
+
+async function processCustomerBookingPayment(req, res) {
+  try {
+    const bookingId = req.params.id || req.body?.bookingId;
+    if (!bookingId) {
+      return res.status(400).json({
+        success: false,
+        message: "Booking ID is required",
+      });
+    }
+
+    const booking = await Booking.findById(bookingId);
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        message: "Booking not found",
+      });
+    }
+
+    const normalizedEmail = (req.user.email || "").toLowerCase().trim();
+    const isOwner =
+      (booking.customerId &&
+        String(booking.customerId) === String(req.user.userId)) ||
+      (booking.customerEmail || "").toLowerCase().trim() === normalizedEmail;
+
+    if (!isOwner) {
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden: You can only pay for your own booking",
+      });
+    }
+
+    if (booking.status !== "completed") {
+      return res.status(400).json({
+        success: false,
+        message: "Payment is available only once the repair is completed.",
+      });
+    }
+
+    if (booking.paymentStatus === "paid") {
+      const existingPayment = await Payment.findOne({
+        bookingId: booking._id,
+        type: "booking",
+        status: "paid",
+      });
+      const existingRaw =
+        (await Booking.collection.findOne({ _id: booking._id })) || booking;
+
+      return res.status(200).json({
+        success: true,
+        message: "This booking has already been paid.",
+        transactionId:
+          existingPayment?.transactionId || booking.transactionId || "",
+        payment: existingPayment || null,
+        data: normalizeBookingRecord(existingRaw),
+      });
+    }
+
+    const sessionId = String(
+      req.body?.stripeSessionId || req.body?.sessionId || ""
+    ).trim();
+    if (sessionId) {
+      const existingSessionPayment = await Payment.findOne({
+        stripeSessionId: sessionId,
+        status: "paid",
+      });
+      if (existingSessionPayment) {
+        return res.status(200).json({
+          success: true,
+          message: "Payment already recorded for this checkout session.",
+          transactionId: existingSessionPayment.transactionId,
+          payment: existingSessionPayment,
+        });
+      }
+    }
+
+    const amount = Number(
+      booking.finalAmount || booking.totalPrice || booking.startingPrice || 0
+    );
+    const transactionId =
+      String(
+        req.body?.paymentIntentId || req.body?.transactionId || ""
+      ).trim() ||
+      `pi_${Date.now()
+        .toString(36)
+        .toUpperCase()}${Math.random()
+        .toString(36)
+        .substring(2, 6)
+        .toUpperCase()}`;
+    const paidAt = new Date();
+
+    booking.paymentStatus = "paid";
+    booking.paidAmount = amount;
+    booking.transactionId = transactionId;
+    booking.paidAt = paidAt;
+    await booking.save();
+    await appendBookingStatusHistory(booking._id, "paid", paidAt);
+
+    let payment;
+    try {
+      payment = await Payment.create({
+        type: "booking",
+        plan: "",
+        bookingId: booking._id,
+        serviceTitle: booking.serviceTitle || "Repair Service",
+        customerName: booking.customerName || "Customer",
+        customerEmail: booking.customerEmail || normalizedEmail,
+        technicianId: booking.technicianId || null,
+        technicianName: booking.technicianName || "Technician",
+        technicianEmail: (booking.technicianEmail || "").toLowerCase().trim(),
+        userId: booking.customerId || req.user.userId,
+        userName: booking.customerName || "Customer",
+        userEmail: booking.customerEmail || normalizedEmail,
+        userRole: "customer",
+        amount,
+        currency: "usd",
+        provider: "stripe",
+        transactionId,
+        stripeSessionId: sessionId || undefined,
+        status: "paid",
+        paidAt,
+      });
+    } catch (error) {
+      if (error?.code === 11000 && sessionId) {
+        const existingPayment = await Payment.findOne({
+          stripeSessionId: sessionId,
+          status: "paid",
+        });
+        if (existingPayment) {
+          return res.status(200).json({
+            success: true,
+            message: "Payment already recorded for this checkout session.",
+            transactionId: existingPayment.transactionId,
+            payment: existingPayment,
+          });
+        }
+      }
+      throw error;
+    }
+
+    const freshRaw = await Booking.collection.findOne({ _id: booking._id });
+
+    res.status(200).json({
+      success: true,
+      message: "Payment completed successfully",
+      transactionId,
+      payment,
+      data: normalizeBookingRecord(freshRaw || booking),
+    });
+  } catch (error) {
+    console.error("Error processing booking payment:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+}
+
+app.post(
+  "/api/payments/create-checkout-session",
+  verifyToken,
+  verifyCustomer,
+  processCustomerBookingPayment
+);
+app.post(
+  "/api/bookings/:id/pay",
+  verifyToken,
+  verifyCustomer,
+  processCustomerBookingPayment
+);
+
+async function submitCustomerBookingReview(req, res) {
+  try {
+    const rawRating =
+      req.body?.rating ?? req.body?.reviewRating ?? req.body?.stars;
+    const rawReview =
+      req.body?.review ?? req.body?.reviewText ?? req.body?.comment ?? "";
+    const numericRating = Number(rawRating);
+    const trimmedReview = String(rawReview || "").trim();
+
+    if (
+      !Number.isFinite(numericRating) ||
+      numericRating < 1 ||
+      numericRating > 5
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Rating must be a number between 1 and 5.",
+      });
+    }
+
+    if (!trimmedReview) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide a short review.",
+      });
+    }
+
+    const booking = await Booking.findById(req.params.id);
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        message: "Booking not found",
+      });
+    }
+
+    const normalizedEmail = (req.user.email || "").toLowerCase().trim();
+    const isOwner =
+      (booking.customerId &&
+        String(booking.customerId) === String(req.user.userId)) ||
+      (booking.customerEmail || "").toLowerCase().trim() === normalizedEmail;
+
+    if (!isOwner) {
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden: You can only review your own booking",
+      });
+    }
+
+    if (String(booking.paymentStatus || "").toLowerCase().trim() !== "paid") {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Rating and review can be submitted only after the booking is paid.",
+      });
+    }
+
+    const roundedRating = Math.round(numericRating);
+    const reviewedAt = new Date();
+
+    await Booking.collection.updateOne(
+      { _id: booking._id },
+      {
+        $set: {
+          rating: roundedRating,
+          review: trimmedReview,
+          reviewedAt,
+          updatedAt: reviewedAt,
+        },
+      }
+    );
+
+    const updatedRaw = await Booking.collection.findOne({ _id: booking._id });
+    const normalizedBooking = normalizeBookingRecord(updatedRaw || booking);
+    const ratingSummary = await recalculateServiceRating(booking.serviceId);
+
+    res.status(200).json({
+      success: true,
+      message: "Rating and review submitted successfully",
+      data: normalizedBooking,
+      serviceRating: ratingSummary,
+    });
+  } catch (error) {
+    console.error("Error submitting booking review:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+}
+
+app.post(
+  "/api/bookings/:id/review",
+  verifyToken,
+  verifyCustomer,
+  submitCustomerBookingReview
+);
+app.patch(
+  "/api/bookings/:id",
+  verifyToken,
+  verifyCustomer,
+  submitCustomerBookingReview
+);
+
+async function getTechnicianBookingsHandler(req, res) {
+  try {
+    const normalizedEmail = (req.user.email || "").toLowerCase().trim();
+    const rawBookings = await Booking.collection
+      .find({
+        $or: [
+          { technicianId: req.user.userId },
+          { technicianEmail: normalizedEmail },
+        ],
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+    const bookings = await attachLatestTechnicianNamesToBookings(rawBookings);
+
+    res.status(200).json({
+      success: true,
+      count: bookings.length,
+      data: bookings,
+    });
+  } catch (error) {
+    console.error("Error fetching technician bookings:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+}
+
+app.get(
+  "/api/bookings/technician",
+  verifyToken,
+  verifyTechnician,
+  getTechnicianBookingsHandler
+);
+app.get(
+  "/api/technician/bookings",
+  verifyToken,
+  verifyTechnician,
+  getTechnicianBookingsHandler
+);
+
+app.patch(
+  "/api/bookings/:id/status",
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const { status } = req.body;
+      const nextStatus = normalizeStatusStep(status);
+
+      const booking = await Booking.findById(req.params.id);
+      if (!booking) {
+        return res.status(404).json({
+          success: false,
+          message: "Booking not found",
+        });
+      }
+
+      const normalizedEmail = (req.user.email || "").toLowerCase().trim();
+      const isAssignedTech =
+        (booking.technicianId &&
+          String(booking.technicianId) === String(req.user.userId)) ||
+        (booking.technicianEmail || "").toLowerCase().trim() ===
+          normalizedEmail;
+
+      if (!isAssignedTech) {
+        return res.status(403).json({
+          success: false,
+          message: "Forbidden: This booking is not assigned to you",
+        });
+      }
+
+      const currentStatus = normalizeStatusStep(booking.status || "requested");
+
+      const allowedTransitions = {
+        requested: ["accepted", "rejected"],
+        accepted: ["in-progress"],
+        "in-progress": ["completed"],
+      };
+
+      const validNextStatuses = allowedTransitions[currentStatus] || [];
+      if (!validNextStatuses.includes(nextStatus)) {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot change status from "${currentStatus}" to "${nextStatus}".`,
+        });
+      }
+
+      const changedAt = new Date();
+      booking.status = nextStatus;
+      await booking.save();
+      await appendBookingStatusHistory(booking._id, nextStatus, changedAt);
+
+      const freshRaw = await Booking.collection.findOne({ _id: booking._id });
+
+      res.status(200).json({
+        success: true,
+        message: `Booking status updated to ${nextStatus}`,
+        data: normalizeBookingRecord(freshRaw || booking),
+      });
+    } catch (error) {
+      console.error("Error updating booking status:", error);
+      res.status(500).json({
+        success: false,
+        message: "Internal Server Error",
+      });
+    }
+  }
+);
+
 async function startServer() {
   try {
     await connectDB();
