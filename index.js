@@ -2271,6 +2271,487 @@ app.delete(
   deleteTechnicianServiceHandler
 );
 
+app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const users = await User.find({}).select("-password").sort({ createdAt: -1 });
+
+    res.status(200).json({
+      success: true,
+      count: users.length,
+      data: users.map((u) => formatSafeUser(u)),
+    });
+  } catch (error) {
+    console.error("Error fetching users:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+});
+
+app.patch(
+  "/api/admin/users/:id/role",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { role } = req.body;
+      const allowedRoles = ["customer", "technician", "admin"];
+
+      if (!allowedRoles.includes(role)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid role specified",
+        });
+      }
+
+      const targetUser = await User.findById(req.params.id).select("-password");
+      if (!targetUser) {
+        return res.status(404).json({
+          success: false,
+          message: "User not found",
+        });
+      }
+
+      const isSelf =
+        String(targetUser._id) === String(req.user.userId) ||
+        targetUser.email?.toLowerCase() === req.user.email?.toLowerCase();
+
+      if (isSelf) {
+        return res.status(400).json({
+          success: false,
+          message: "Your own role cannot be changed here.",
+        });
+      }
+
+      targetUser.role = role;
+      await targetUser.save();
+
+      res.status(200).json({
+        success: true,
+        message: "User role updated successfully",
+        data: formatSafeUser(targetUser),
+      });
+    } catch (error) {
+      console.error("Error updating user role:", error);
+      res.status(500).json({
+        success: false,
+        message: "Internal Server Error",
+      });
+    }
+  }
+);
+
+app.get("/api/admin/services", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const rawServices = await Service.find({}).sort({ createdAt: -1 });
+    const services = await attachLatestTechnicianNames(rawServices);
+
+    res.status(200).json({
+      success: true,
+      count: services.length,
+      data: services,
+    });
+  } catch (error) {
+    console.error("Error fetching admin services:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+});
+
+app.get("/api/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const rawBookings = await Booking.collection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+    const bookings = await attachLatestTechnicianNamesToBookings(rawBookings);
+
+    res.status(200).json({
+      success: true,
+      count: bookings.length,
+      data: bookings,
+    });
+  } catch (error) {
+    console.error("Error fetching admin bookings:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+});
+
+app.get("/api/admin/payments", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const [recordedPayments, paidBookings] = await Promise.all([
+      Payment.find({ status: "paid" }).sort({ paidAt: -1, createdAt: -1 }),
+      Booking.find({ paymentStatus: "paid" }).sort({
+        paidAt: -1,
+        updatedAt: -1,
+      }),
+    ]);
+
+    const recordedBookingIds = new Set(
+      recordedPayments
+        .filter((p) => p.bookingId)
+        .map((p) => String(p.bookingId))
+    );
+
+    const legacyBookingPayments = paidBookings
+      .filter((b) => !recordedBookingIds.has(String(b._id)))
+      .map((b) => ({
+        _id: b._id,
+        type: "booking",
+        plan: "",
+        bookingId: b._id,
+        serviceTitle: b.serviceTitle || "Repair Service",
+        userId: b.customerId || null,
+        userName: b.customerName || "Customer",
+        userEmail: b.customerEmail || "",
+        customerName: b.customerName || "Customer",
+        customerEmail: b.customerEmail || "",
+        technicianId: b.technicianId || null,
+        technicianName: b.technicianName || "Technician",
+        technicianEmail: b.technicianEmail || "",
+        amount: Number(
+          b.paidAmount || b.finalAmount || b.totalPrice || b.startingPrice || 0
+        ),
+        paidAmount: Number(
+          b.paidAmount || b.finalAmount || b.totalPrice || b.startingPrice || 0
+        ),
+        currency: "usd",
+        transactionId: b.transactionId || "",
+        stripeSessionId: "",
+        paymentStatus: "paid",
+        status: "paid",
+        paidAt: b.paidAt || b.updatedAt,
+      }));
+
+    const paymentBookingIds = [
+      ...new Set(
+        recordedPayments
+          .filter((p) => p.bookingId)
+          .map((p) => String(p.bookingId))
+      ),
+    ];
+    const paymentBookings = paymentBookingIds.length
+      ? await Booking.find({ _id: { $in: paymentBookingIds } })
+      : [];
+    const paymentBookingById = new Map(
+      paymentBookings.map((b) => [String(b._id), b])
+    );
+
+    const normalizedRecorded = recordedPayments.map((p) => {
+      const obj = p.toObject();
+      const booking = obj.bookingId
+        ? paymentBookingById.get(String(obj.bookingId))
+        : null;
+      return {
+        ...obj,
+        customerName: obj.customerName || obj.userName,
+        customerEmail: obj.customerEmail || obj.userEmail,
+        paidAmount: obj.amount,
+        currency: obj.currency || "usd",
+        stripeSessionId: obj.stripeSessionId || "",
+        paymentStatus: obj.status,
+        serviceTitle: obj.serviceTitle || booking?.serviceTitle || "",
+        technicianId: obj.technicianId || booking?.technicianId || null,
+        technicianName: obj.technicianName || booking?.technicianName || "",
+        technicianEmail:
+          obj.technicianEmail || booking?.technicianEmail || "",
+      };
+    });
+
+    const allPayments = [...normalizedRecorded, ...legacyBookingPayments].sort(
+      (a, b) => new Date(b.paidAt || 0) - new Date(a.paidAt || 0)
+    );
+
+    const totalRevenue = allPayments.reduce(
+      (sum, item) => sum + Number(item.amount || item.paidAmount || 0),
+      0
+    );
+
+    const subscriptionRevenue = normalizedRecorded
+      .filter((p) => p.type === "subscription")
+      .reduce((sum, item) => sum + Number(item.amount || 0), 0);
+
+    res.status(200).json({
+      success: true,
+      count: allPayments.length,
+      totalRevenue,
+      subscriptionRevenue,
+      data: allPayments,
+    });
+  } catch (error) {
+    console.error("Error fetching admin payments:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+});
+
+async function updateServiceApprovalHandler(req, res) {
+  try {
+    const rawStatus = req.body.status || req.body.approvalStatus;
+    const status = String(rawStatus || "").toLowerCase().trim();
+
+    if (!["pending", "approved", "rejected"].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid status value",
+      });
+    }
+
+    const service = await Service.findById(req.params.id);
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    service.status = status;
+    await service.save();
+
+    res.status(200).json({
+      success: true,
+      message: `Service marked as ${status}`,
+      data: service,
+    });
+  } catch (error) {
+    console.error("Error updating service status:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+}
+
+app.patch(
+  "/api/admin/services/:id/approval",
+  verifyToken,
+  verifyAdmin,
+  updateServiceApprovalHandler
+);
+app.patch(
+  "/api/admin/services/:id/status",
+  verifyToken,
+  verifyAdmin,
+  updateServiceApprovalHandler
+);
+
+app.post("/api/contact", async (req, res) => {
+  try {
+    const { name, email, phone, contactNumber, topic, message } =
+      req.body || {};
+    const resolvedPhone = String(phone || contactNumber || "").trim();
+
+    if (
+      !String(name || "").trim() ||
+      !String(email || "").trim() ||
+      !resolvedPhone ||
+      !String(message || "").trim()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Name, email address, contact number, and message are required.",
+      });
+    }
+
+    const cleanedPhone = resolvedPhone.replace(/[\s()-]/g, "");
+    if (!/^\+?\d{7,15}$/.test(cleanedPhone)) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide a valid contact number.",
+      });
+    }
+
+    const trimmedMessage = String(message).trim();
+    if (trimmedMessage.length < 15) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Please write at least 15 characters so we can assist you properly.",
+      });
+    }
+
+    const createdMessage = await ContactMessage.create({
+      name: String(name).trim(),
+      email: String(email).toLowerCase().trim(),
+      phone: resolvedPhone,
+      contactNumber: resolvedPhone,
+      topic: String(topic || "General Inquiry").trim(),
+      message: trimmedMessage,
+      status: "unread",
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Message sent successfully.",
+      data: createdMessage,
+    });
+  } catch (error) {
+    console.error("Error creating contact message:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+});
+
+app.get("/api/admin/messages", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const messages = await ContactMessage.find({}).sort({ createdAt: -1 });
+
+    res.status(200).json({
+      success: true,
+      count: messages.length,
+      data: messages,
+    });
+  } catch (error) {
+    console.error("Error fetching contact messages:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+});
+
+app.patch(
+  "/api/admin/messages/:id/status",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { status } = req.body;
+      if (!["unread", "read", "replied"].includes(status)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid status value",
+        });
+      }
+
+      const updated = await ContactMessage.findByIdAndUpdate(
+        req.params.id,
+        { status },
+        { returnDocument: "after" }
+      );
+
+      if (!updated) {
+        return res.status(404).json({
+          success: false,
+          message: "Message not found",
+        });
+      }
+
+      res.status(200).json({
+        success: true,
+        message: "Message status updated",
+        data: updated,
+      });
+    } catch (error) {
+      console.error("Error updating message status:", error);
+      res.status(500).json({
+        success: false,
+        message: "Internal Server Error",
+      });
+    }
+  }
+);
+
+app.delete(
+  "/api/admin/messages/:id",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const deleted = await ContactMessage.findByIdAndDelete(req.params.id);
+      if (!deleted) {
+        return res.status(404).json({
+          success: false,
+          message: "Message not found",
+        });
+      }
+
+      res.status(200).json({
+        success: true,
+        message: "Message deleted successfully",
+      });
+    } catch (error) {
+      console.error("Error deleting contact message:", error);
+      res.status(500).json({
+        success: false,
+        message: "Internal Server Error",
+      });
+    }
+  }
+);
+
+app.get("/api/reviews", async (req, res) => {
+  try {
+    const rawReviewedBookings = await Booking.collection
+      .find({
+        rating: { $gte: 1, $lte: 5 },
+      })
+      .sort({ reviewedAt: -1, updatedAt: -1, createdAt: -1 })
+      .limit(30)
+      .toArray();
+
+    const { usersById, usersByEmail } =
+      await mapCustomersByBookingRecords(rawReviewedBookings);
+
+    const reviews = rawReviewedBookings
+      .map((b) => {
+        const norm = normalizeBookingRecord(b);
+        const matchedUser =
+          (norm.customerId && usersById.get(String(norm.customerId))) ||
+          (norm.customerEmail &&
+            usersByEmail.get(String(norm.customerEmail).toLowerCase().trim())) ||
+          null;
+
+        const hasValidComment = Boolean(String(norm.review || "").trim());
+        if (!hasValidComment) return null;
+
+        const isEdited = Boolean(
+          norm.reviewedAt &&
+            norm.createdAt &&
+            new Date(norm.reviewedAt).getTime() >
+              new Date(norm.createdAt).getTime() + 2000
+        );
+
+        return {
+          _id: norm._id,
+          customerName:
+            matchedUser?.name || norm.customerName || "Verified Customer",
+          customerImage: matchedUser?.avatar || norm.customerImage || "",
+          rating: Number(norm.rating),
+          comment: String(norm.review).trim(),
+          serviceTitle: norm.serviceTitle || "Repair Service",
+          createdAt: norm.createdAt || null,
+          updatedAt: norm.reviewedAt || norm.updatedAt || norm.createdAt || null,
+          isEdited,
+        };
+      })
+      .filter(Boolean);
+
+    res.status(200).json({
+      success: true,
+      count: reviews.length,
+      data: reviews,
+    });
+  } catch (error) {
+    console.error("Error fetching public reviews:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+});
+
 async function startServer() {
   try {
     await connectDB();
