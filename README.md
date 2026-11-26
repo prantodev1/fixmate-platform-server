@@ -28,7 +28,7 @@
 
 ## 🌐 Live URL
 
-* **Server Base URL:** `https://your-fixmate-server-url.vercel.app` *(replace with your live deployment URL; local default: `http://localhost:5000`)*
+* **Server Base URL:** (https://fixmate-platform-server-eosin.vercel.app/)*
 
 ---
 
